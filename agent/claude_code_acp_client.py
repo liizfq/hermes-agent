@@ -464,6 +464,17 @@ class ClaudeCodeACPClient:
         self._sandbox_path: Path | None = None
         self._pending_model: str | None = None
 
+        # Seed _pending_model from --model flag in acp_args so the subprocess
+        # uses the requested model even when the calling LLM doesn't pass a
+        # per-call model parameter. The session/new → session/set_config_option
+        # flow in _ensure_session() will route this to claude-agent-acp's
+        # query.setModel() on the first _create_chat_completion call. This is
+        # necessary because the underlying @agentclientprotocol/claude-agent-acp
+        # subprocess silently ignores all CLI args except --cli/--version/
+        # --help/--debug, so the model flag has to flow through ACP's
+        # set_config_option channel rather than argv.
+        self._seed_pending_model_from_acp_args()
+
         self._trace_lock = threading.Lock()
         self._tool_trace: list[ToolCallRecord] = []
         self._tool_records_by_id: dict[str, ToolCallRecord] = {}
@@ -1172,6 +1183,43 @@ class ClaudeCodeACPClient:
         if re.match(r"^claude-(haiku|sonnet|opus)(?:-\d+(?:-\d+)*)?$", normalized):
             return True
         return False
+
+    def _seed_pending_model_from_acp_args(self) -> None:
+        """Seed ``_pending_model`` from a ``--model`` flag in ``self._acp_args``.
+
+        Allows callers to pin the Claude model via the CLI-level ``--model``
+        flag in ``acp_args`` (e.g. ``["--acp", "--stdio", "--model",
+        "claude-sonnet-4-6"]``) even when the calling LLM skips the per-call
+        ``model`` tool parameter. The model is consumed by the existing
+        ``_ensure_session()`` flow which calls
+        ``session/set_config_option({"configId": "model", ...})`` after
+        ``session/new`` — claude-agent-acp routes that to
+        ``query.setModel(resolvedValue)`` on the live SDK query.
+
+        The ``--model`` token is left in ``self._acp_args`` because the
+        underlying ``@agentclientprotocol/claude-agent-acp`` subprocess
+        silently ignores all unknown CLI args, so there's no benefit (and
+        some debugging value) in stripping it.
+        """
+        for i, arg in enumerate(self._acp_args):
+            if arg == "--model" and i + 1 < len(self._acp_args):
+                candidate = self._acp_args[i + 1]
+                if self._is_valid_claude_alias(candidate):
+                    self._pending_model = candidate
+                    logger.info(
+                        "ClaudeCodeACPClient: seeded _pending_model=%r from "
+                        "acp_args --model flag",
+                        candidate,
+                    )
+                else:
+                    logger.warning(
+                        "ClaudeCodeACPClient: ignoring --model=%r from "
+                        "acp_args: not a valid Claude alias (expected "
+                        "opus/sonnet/haiku or claude-{opus,sonnet,haiku}-*)",
+                        candidate,
+                    )
+                # Only honor the first --model flag
+                return
 
     def _create_chat_completion(
         self,
