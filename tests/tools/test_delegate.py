@@ -3060,5 +3060,291 @@ class TestPerCallApiParams(unittest.TestCase):
             self.assertEqual(kwargs["override_api_key"], "sk-or-registry-test-key")
 
 
+@patch("tools.delegate_tool._load_config")
+@patch("tools.delegate_tool._resolve_delegation_credentials")
+@patch("tools.delegate_tool._run_single_child")
+@patch("run_agent.AIAgent")
+class TestDelegateTaskEndToEndModelRouting(unittest.TestCase):
+    """End-to-end: model/provider/base_url/api_format/api_key flow from
+    delegate_task() all the way into the constructed AIAgent() instance.
+
+    Mocks only the deepest layer (run_agent.AIAgent) so we can capture
+    the kwargs the real _build_child_agent passes to the AIAgent
+    constructor.  This proves the new per-call/per-task API is fully
+    wired through to the child agent's actual LLM client config.
+    """
+
+    def _base_creds(self):
+        return {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+
+    def _make_run_result(self, index=0):
+        return {
+            "task_index": index,
+            "status": "completed",
+            "summary": "OK",
+            "api_calls": 1,
+            "duration_seconds": 0.5,
+        }
+
+    def _setup(self, mock_aia, mock_run, mock_creds, mock_cfg, creds_override=None):
+        """Wire up mocks for a single test. Returns the (mock_aia, mock_run)."""
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        if creds_override:
+            creds.update(creds_override)
+        mock_creds.return_value = creds
+        mock_aia.return_value = MagicMock()
+        mock_run.return_value = self._make_run_result()
+        return mock_aia, mock_run
+
+    # ── per-call ────────────────────────────────────────────────────────
+
+    def test_e2e_per_call_model_reaches_aia(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """delegate_task(model="X") → AIAgent(model="X")."""
+        self._setup(mock_aia, mock_run, mock_creds, mock_cfg)
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            goal="e2e test",
+            model="claude-sonnet-4-6",
+            parent_agent=parent,
+        )
+        _, kwargs = mock_aia.call_args
+        self.assertEqual(kwargs["model"], "claude-sonnet-4-6")
+
+    def test_e2e_per_call_provider_reaches_aia(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """delegate_task(provider="X") → AIAgent(provider="X")."""
+        self._setup(mock_aia, mock_run, mock_creds, mock_cfg)
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            goal="e2e provider",
+            provider="openrouter",
+            parent_agent=parent,
+        )
+        _, kwargs = mock_aia.call_args
+        self.assertEqual(kwargs["provider"], "openrouter")
+
+    def test_e2e_per_call_base_url_reaches_aia(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """delegate_task(base_url="X") → AIAgent(base_url="X")."""
+        self._setup(mock_aia, mock_run, mock_creds, mock_cfg)
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            goal="e2e base_url",
+            base_url="https://openrouter.ai/api/v1",
+            parent_agent=parent,
+        )
+        _, kwargs = mock_aia.call_args
+        self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
+
+    def test_e2e_per_call_api_format_reaches_aia(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """delegate_task(api_format="anthropic") → AIAgent(api_mode="anthropic_messages")."""
+        self._setup(mock_aia, mock_run, mock_creds, mock_cfg)
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            goal="e2e api_format",
+            api_format="anthropic",
+            parent_agent=parent,
+        )
+        _, kwargs = mock_aia.call_args
+        self.assertEqual(kwargs["api_mode"], "anthropic_messages")
+
+    def test_e2e_per_call_api_key_reaches_aia(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """delegate_task(api_key="X") → AIAgent(api_key="X")."""
+        self._setup(mock_aia, mock_run, mock_creds, mock_cfg)
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            goal="e2e api_key",
+            api_key="sk-or-e2e-test",
+            parent_agent=parent,
+        )
+        _, kwargs = mock_aia.call_args
+        self.assertEqual(kwargs["api_key"], "sk-or-e2e-test")
+
+    def test_e2e_per_call_all_params_together(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """All 5 per-call params at once → all 5 reach AIAgent()."""
+        self._setup(mock_aia, mock_run, mock_creds, mock_cfg)
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            goal="e2e all params",
+            model="claude-sonnet-4-6",
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            api_format="openai",
+            api_key="sk-or-all-params",
+            parent_agent=parent,
+        )
+        _, kwargs = mock_aia.call_args
+        self.assertEqual(kwargs["model"], "claude-sonnet-4-6")
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(kwargs["api_mode"], "chat_completions")
+        self.assertEqual(kwargs["api_key"], "sk-or-all-params")
+
+    # ── per-task overrides ──────────────────────────────────────────────
+
+    def test_e2e_per_task_model_reaches_aia(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """tasks[0].model="X" → that task's AIAgent gets model="X"."""
+        self._setup(mock_aia, mock_run, mock_creds, mock_cfg)
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            tasks=[
+                {"goal": "task A", "model": "claude-sonnet-4-6"},
+                {"goal": "task B", "model": "claude-opus-4-7"},
+            ],
+            parent_agent=parent,
+        )
+        self.assertEqual(mock_aia.call_args_list[0].kwargs["model"], "claude-sonnet-4-6")
+        self.assertEqual(mock_aia.call_args_list[1].kwargs["model"], "claude-opus-4-7")
+
+    def test_e2e_per_task_provider_reaches_aia(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """tasks[0].provider="X" → that task's AIAgent gets provider="X"."""
+        self._setup(mock_aia, mock_run, mock_creds, mock_cfg)
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            tasks=[
+                {"goal": "task A", "provider": "anthropic"},
+                {"goal": "task B", "provider": "openai"},
+            ],
+            parent_agent=parent,
+        )
+        self.assertEqual(mock_aia.call_args_list[0].kwargs["provider"], "anthropic")
+        self.assertEqual(mock_aia.call_args_list[1].kwargs["provider"], "openai")
+
+    def test_e2e_per_task_api_format_reaches_aia(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """tasks[].api_format is mapped to api_mode and reaches AIAgent."""
+        self._setup(mock_aia, mock_run, mock_creds, mock_cfg)
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            tasks=[
+                {"goal": "task A", "api_format": "openai"},
+                {"goal": "task B", "api_format": "anthropic"},
+                {"goal": "task C", "api_format": "codex"},
+            ],
+            parent_agent=parent,
+        )
+        self.assertEqual(mock_aia.call_args_list[0].kwargs["api_mode"], "chat_completions")
+        self.assertEqual(mock_aia.call_args_list[1].kwargs["api_mode"], "anthropic_messages")
+        self.assertEqual(mock_aia.call_args_list[2].kwargs["api_mode"], "codex_responses")
+
+    # ── priority chain ──────────────────────────────────────────────────
+
+    def test_e2e_priority_per_task_beats_per_call(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """Per-task overrides beat per-call overrides all the way to AIAgent."""
+        self._setup(mock_aia, mock_run, mock_creds, mock_cfg)
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            tasks=[
+                {
+                    "goal": "task A",
+                    "model": "task-model",
+                    "provider": "task-provider",
+                    "base_url": "https://task.example.com/v1",
+                    "api_format": "codex",
+                    "api_key": "task-key",
+                },
+            ],
+            model="call-model",
+            provider="call-provider",
+            base_url="https://call.example.com/v1",
+            api_format="anthropic",
+            api_key="call-key",
+            parent_agent=parent,
+        )
+        _, kwargs = mock_aia.call_args
+        self.assertEqual(kwargs["model"], "task-model")
+        self.assertEqual(kwargs["provider"], "task-provider")
+        self.assertEqual(kwargs["base_url"], "https://task.example.com/v1")
+        self.assertEqual(kwargs["api_mode"], "codex_responses")
+        self.assertEqual(kwargs["api_key"], "task-key")
+
+    def test_e2e_priority_per_call_beats_config(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """Per-call beats config; config has no effect when per-call is set."""
+        self._setup(
+            mock_aia, mock_run, mock_creds, mock_cfg,
+            creds_override={
+                "model": "config-model",
+                "provider": "config-provider",
+                "base_url": "https://config.example.com/v1",
+                "api_mode": "chat_completions",
+                "api_key": "config-key",
+            },
+        )
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(
+            goal="call beats config",
+            model="call-model",
+            provider="call-provider",
+            base_url="https://call.example.com/v1",
+            api_format="anthropic",
+            api_key="call-key",
+            parent_agent=parent,
+        )
+        _, kwargs = mock_aia.call_args
+        self.assertEqual(kwargs["model"], "call-model")
+        self.assertEqual(kwargs["provider"], "call-provider")
+        self.assertEqual(kwargs["base_url"], "https://call.example.com/v1")
+        self.assertEqual(kwargs["api_mode"], "anthropic_messages")
+        self.assertEqual(kwargs["api_key"], "call-key")
+
+    def test_e2e_config_value_used_when_no_override(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """When no per-call/per-task override, config value reaches AIAgent."""
+        self._setup(
+            mock_aia, mock_run, mock_creds, mock_cfg,
+            creds_override={
+                "model": "config-model",
+                "provider": "config-provider",
+                "base_url": "https://config.example.com/v1",
+                "api_mode": "chat_completions",
+                "api_key": "config-key",
+            },
+        )
+        parent = _make_mock_parent(depth=0)
+
+        delegate_task(goal="inherit from config", parent_agent=parent)
+        _, kwargs = mock_aia.call_args
+        self.assertEqual(kwargs["model"], "config-model")
+        self.assertEqual(kwargs["provider"], "config-provider")
+        self.assertEqual(kwargs["base_url"], "https://config.example.com/v1")
+        self.assertEqual(kwargs["api_key"], "config-key")
+
+    # ── schema exposure ─────────────────────────────────────────────────
+
+    def test_e2e_schema_model_is_string_not_dict(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """Schema exposes model as a plain string (not a Dict form)."""
+        top_model = DELEGATE_TASK_SCHEMA["parameters"]["properties"].get("model")
+        self.assertIsNotNone(top_model, "top-level 'model' must be in schema")
+        self.assertEqual(
+            top_model["type"], "string",
+            "model must be type=string (legacy Dict form removed per #35437)",
+        )
+
+    def test_e2e_schema_per_task_model_is_string_not_dict(self, mock_aia, mock_run, mock_creds, mock_cfg):
+        """Per-task schema exposes model as a plain string."""
+        task_props = (
+            DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]
+        )
+        self.assertIn("model", task_props)
+        self.assertEqual(
+            task_props["model"]["type"], "string",
+            "per-task model must be type=string (legacy Dict form removed)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
