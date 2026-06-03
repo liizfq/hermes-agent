@@ -20,6 +20,7 @@ from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
     DelegateEvent,
+    _api_format_to_mode,
     _get_max_concurrent_children,
     _LEGACY_EVENT_MAP,
     MAX_DEPTH,
@@ -2664,6 +2665,457 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+class TestApiFormatToMode(unittest.TestCase):
+    """Tests for _api_format_to_mode helper (per #35437)."""
+
+    def test_openai_maps_to_chat_completions(self):
+        self.assertEqual(_api_format_to_mode("openai"), "chat_completions")
+
+    def test_anthropic_maps_to_anthropic_messages(self):
+        self.assertEqual(_api_format_to_mode("anthropic"), "anthropic_messages")
+
+    def test_codex_maps_to_codex_responses(self):
+        self.assertEqual(_api_format_to_mode("codex"), "codex_responses")
+
+    def test_case_insensitive(self):
+        self.assertEqual(_api_format_to_mode("OpenAI"), "chat_completions")
+        self.assertEqual(_api_format_to_mode("ANTHROPIC"), "anthropic_messages")
+
+    def test_whitespace_trimmed(self):
+        self.assertEqual(_api_format_to_mode("  openai  "), "chat_completions")
+
+    def test_internal_mode_names_accepted(self):
+        self.assertEqual(_api_format_to_mode("chat_completions"), "chat_completions")
+        self.assertEqual(_api_format_to_mode("anthropic_messages"), "anthropic_messages")
+
+    def test_unknown_format_raises_valueerror(self):
+        with self.assertRaises(ValueError) as ctx:
+            _api_format_to_mode("unknown_format")
+        self.assertIn("unknown_format", str(ctx.exception))
+
+    def test_schema_has_new_top_level_params(self):
+        """The schema exposes provider, model_name, base_url, api_format, api_key at top level."""
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("provider", props)
+        self.assertEqual(props["provider"]["type"], "string")
+        self.assertIn("model_name", props)
+        self.assertEqual(props["model_name"]["type"], "string")
+        self.assertIn("base_url", props)
+        self.assertEqual(props["base_url"]["type"], "string")
+        self.assertIn("api_format", props)
+        self.assertIn("openai", props["api_format"]["enum"])
+        self.assertIn("api_key", props)
+        self.assertEqual(props["api_key"]["type"], "string")
+
+    def test_schema_has_new_per_task_params(self):
+        """The schema exposes provider, model_name, base_url, api_format, api_key in tasks[]."""
+        task_props = (
+            DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]
+        )
+        self.assertIn("provider", task_props)
+        self.assertIn("model_name", task_props)
+        self.assertIn("base_url", task_props)
+        self.assertIn("api_format", task_props)
+        self.assertIn("api_key", task_props)
+
+
+@patch("tools.delegate_tool._load_config")
+@patch("tools.delegate_tool._resolve_delegation_credentials")
+class TestPerCallApiParams(unittest.TestCase):
+    """Tests for per-call provider/model_name/base_url/api_format/api_key (#35437)."""
+
+    def _base_creds(self):
+        return {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+
+    def _make_run_result(self, index=0):
+        return {
+            "task_index": index,
+            "status": "completed",
+            "summary": "Done",
+            "api_calls": 1,
+            "duration_seconds": 1.0,
+        }
+
+    def test_per_call_model_name_overrides_config(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        creds["model"] = "config-model"
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+            delegate_task(
+                goal="test model_name",
+                model_name="claude-sonnet-4-6",
+                parent_agent=parent,
+            )
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["model"], "claude-sonnet-4-6")
+
+    def test_per_call_provider_overrides_config(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        creds["provider"] = "config-provider"
+        creds["base_url"] = "https://config.example.com/v1"
+        creds["api_mode"] = "chat_completions"
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+            delegate_task(
+                goal="test provider",
+                provider="anthropic",
+                parent_agent=parent,
+            )
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["override_provider"], "anthropic")
+
+    def test_per_call_base_url_overrides_config(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        creds["base_url"] = "https://config.example.com/v1"
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+            delegate_task(
+                goal="test base_url",
+                base_url="https://custom.example.com/v1",
+                parent_agent=parent,
+            )
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["override_base_url"], "https://custom.example.com/v1")
+
+    def test_per_call_api_format_overrides_config(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        creds["api_mode"] = "chat_completions"
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+            delegate_task(
+                goal="test api_format",
+                api_format="anthropic",
+                parent_agent=parent,
+            )
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["override_api_mode"], "anthropic_messages")
+
+    def test_per_call_api_key_overrides_config(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        creds["api_key"] = "config-key"
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+            delegate_task(
+                goal="test api_key",
+                api_key="sk-per-call-key",
+                parent_agent=parent,
+            )
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["override_api_key"], "sk-per-call-key")
+
+    def test_per_call_api_format_unknown_raises(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 45}
+        mock_creds.return_value = self._base_creds()
+        parent = _make_mock_parent(depth=0)
+
+        result = delegate_task(
+            goal="bad format",
+            api_format="totally_invalid",
+            parent_agent=parent,
+        )
+        parsed = json.loads(result)
+        self.assertIn("error", parsed)
+        self.assertIn("totally_invalid", parsed["error"])
+
+    def test_legacy_model_dict_still_works(self, mock_creds, mock_cfg):
+        """The legacy model: Dict[str, str] param is preserved for backward compat."""
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+            delegate_task(
+                goal="legacy dict",
+                model={"model": "gpt-4o", "provider": "openai"},
+                parent_agent=parent,
+            )
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["model"], "gpt-4o")
+            self.assertEqual(kwargs["override_provider"], "openai")
+
+    def test_new_model_name_beats_legacy_dict(self, mock_creds, mock_cfg):
+        """When both model_name and model dict are set, model_name wins."""
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+            delegate_task(
+                goal="both set",
+                model={"model": "legacy-model", "provider": "legacy-provider"},
+                model_name="new-model",
+                provider="new-provider",
+                parent_agent=parent,
+            )
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["model"], "new-model")
+            self.assertEqual(kwargs["override_provider"], "new-provider")
+
+    def test_batch_per_task_new_params_override_per_call(self, mock_creds, mock_cfg):
+        """Per-task provider/model_name/base_url/api_format/api_key beat per-call."""
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        creds["model"] = "call-model"
+        creds["provider"] = "call-provider"
+        creds["base_url"] = "https://call.example.com/v1"
+        creds["api_mode"] = "chat_completions"
+        creds["api_key"] = "call-key"
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+
+            tasks = [
+                {
+                    "goal": "task A",
+                    "model_name": "task-model-a",
+                    "provider": "task-provider-a",
+                    "base_url": "https://task-a.example.com/v1",
+                    "api_format": "anthropic",
+                    "api_key": "task-key-a",
+                },
+                {"goal": "task B"},  # inherits per-call
+            ]
+
+            delegate_task(
+                tasks=tasks,
+                provider="call-provider",
+                model_name="call-model",
+                parent_agent=parent,
+            )
+
+            # Task A: all per-task overrides applied
+            call_a = mock_build.call_args_list[0]
+            self.assertEqual(call_a.kwargs.get("model"), "task-model-a")
+            self.assertEqual(call_a.kwargs.get("override_provider"), "task-provider-a")
+            self.assertEqual(
+                call_a.kwargs.get("override_base_url"), "https://task-a.example.com/v1"
+            )
+            self.assertEqual(call_a.kwargs.get("override_api_mode"), "anthropic_messages")
+            self.assertEqual(call_a.kwargs.get("override_api_key"), "task-key-a")
+
+            # Task B: inherits per-call values
+            call_b = mock_build.call_args_list[1]
+            self.assertEqual(call_b.kwargs.get("model"), "call-model")
+            self.assertEqual(call_b.kwargs.get("override_provider"), "call-provider")
+            self.assertEqual(
+                call_b.kwargs.get("override_base_url"), "https://call.example.com/v1"
+            )
+            self.assertEqual(call_b.kwargs.get("override_api_key"), "call-key")
+
+    def test_per_task_legacy_dict_still_works(self, mock_creds, mock_cfg):
+        """Per-task legacy model dict (model: {model: ..., provider: ...}) still works."""
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        creds["model"] = "call-model"
+        creds["provider"] = "call-provider"
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+
+            tasks = [
+                {"goal": "legacy task", "model": {"model": "legacy-gpt", "provider": "openai"}},
+            ]
+
+            delegate_task(tasks=tasks, parent_agent=parent)
+
+            call = mock_build.call_args_list[0]
+            self.assertEqual(call.kwargs.get("model"), "legacy-gpt")
+            self.assertEqual(call.kwargs.get("override_provider"), "openai")
+
+    def test_per_task_new_string_beats_legacy_dict(self, mock_creds, mock_cfg):
+        """When per-task has both model_name and legacy model dict, model_name wins."""
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+
+            tasks = [
+                {
+                    "goal": "both forms",
+                    "model": {"model": "legacy-model", "provider": "legacy-prov"},
+                    "model_name": "new-model",
+                    "provider": "new-prov",
+                },
+            ]
+
+            delegate_task(tasks=tasks, parent_agent=parent)
+
+            call = mock_build.call_args_list[0]
+            self.assertEqual(call.kwargs.get("model"), "new-model")
+            self.assertEqual(call.kwargs.get("override_provider"), "new-prov")
+
+    def test_priority_chain_per_task_wins(self, mock_creds, mock_cfg):
+        """Full priority: per-task > per-call > config > parent."""
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        creds["model"] = "config-model"
+        creds["provider"] = "config-provider"
+        creds["base_url"] = "https://config.example.com/v1"
+        creds["api_mode"] = "chat_completions"
+        creds["api_key"] = "config-key"
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+
+            tasks = [
+                {
+                    "goal": "per-task wins",
+                    "model_name": "task-model",
+                    "provider": "task-provider",
+                    "base_url": "https://task.example.com/v1",
+                    "api_format": "codex",
+                    "api_key": "task-key",
+                },
+            ]
+
+            delegate_task(
+                tasks=tasks,
+                provider="call-provider",
+                model_name="call-model",
+                base_url="https://call.example.com/v1",
+                api_format="anthropic",
+                api_key="call-key",
+                parent_agent=parent,
+            )
+
+            call = mock_build.call_args_list[0]
+            self.assertEqual(call.kwargs.get("model"), "task-model")
+            self.assertEqual(call.kwargs.get("override_provider"), "task-provider")
+            self.assertEqual(
+                call.kwargs.get("override_base_url"), "https://task.example.com/v1"
+            )
+            self.assertEqual(call.kwargs.get("override_api_mode"), "codex_responses")
+            self.assertEqual(call.kwargs.get("override_api_key"), "task-key")
+
+    def test_per_call_overrides_config_when_no_task_override(self, mock_creds, mock_cfg):
+        """Per-call beats config when no per-task override is set."""
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        creds["model"] = "config-model"
+        creds["provider"] = "config-provider"
+        creds["base_url"] = "https://config.example.com/v1"
+        creds["api_mode"] = "chat_completions"
+        creds["api_key"] = "config-key"
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+            delegate_task(
+                goal="call beats config",
+                provider="call-provider",
+                model_name="call-model",
+                base_url="https://call.example.com/v1",
+                api_format="anthropic",
+                api_key="call-key",
+                parent_agent=parent,
+            )
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["model"], "call-model")
+            self.assertEqual(kwargs["override_provider"], "call-provider")
+            self.assertEqual(kwargs["override_base_url"], "https://call.example.com/v1")
+            self.assertEqual(kwargs["override_api_mode"], "anthropic_messages")
+            self.assertEqual(kwargs["override_api_key"], "call-key")
+
+    def test_registry_handler_passes_new_params(self, mock_creds, mock_cfg):
+        """The registry handler correctly forwards new params to delegate_task."""
+        mock_cfg.return_value = {"max_iterations": 45}
+        creds = self._base_creds()
+        mock_creds.return_value = creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = self._make_run_result()
+
+            from tools.registry import registry
+
+            entry = registry.get_entry("delegate_task")
+            self.assertIsNotNone(entry)
+            handler = entry.handler
+            handler(
+                {
+                    "goal": "via registry",
+                    "provider": "openrouter",
+                    "model_name": "claude-sonnet-4-6",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_format": "openai",
+                    "api_key": "sk-or-registry",
+                },
+                parent_agent=parent,
+            )
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["model"], "claude-sonnet-4-6")
+            self.assertEqual(kwargs["override_provider"], "openrouter")
+            self.assertEqual(kwargs["override_base_url"], "https://openrouter.ai/api/v1")
+            self.assertEqual(kwargs["override_api_mode"], "chat_completions")
+            self.assertEqual(kwargs["override_api_key"], "sk-or-registry")
 
 
 if __name__ == "__main__":

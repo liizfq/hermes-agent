@@ -1930,6 +1930,11 @@ def delegate_task(
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
     model: Optional[Dict[str, str]] = None,
+    provider: Optional[str] = None,
+    model_name: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_format: Optional[str] = None,
+    api_key: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -1943,6 +1948,13 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    Per-call credential parameters (provider, model_name, base_url,
+    api_format, api_key) override delegation config and parent
+    inheritance.  Per-task overrides in tasks[].{provider, model_name,
+    ...} beat per-call overrides.  The legacy ``model: Dict[str, str]``
+    parameter is preserved for backward compatibility; prefer the new
+    string ``model_name`` parameter for new code.
 
     Returns JSON with results array, one entry per task.
     """
@@ -2009,6 +2021,21 @@ def delegate_task(
         if model.get("provider"):
             creds["provider"] = model["provider"]
 
+    # New per-call string params (per #35437) — beat legacy dict when set
+    if model_name:
+        creds["model"] = model_name
+    if provider:
+        creds["provider"] = provider
+    if base_url:
+        creds["base_url"] = base_url
+    if api_format:
+        try:
+            creds["api_mode"] = _api_format_to_mode(api_format)
+        except ValueError as exc:
+            return tool_error(str(exc))
+    if api_key:
+        creds["api_key"] = api_key
+
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2073,11 +2100,34 @@ def delegate_task(
             # Per-task model override beats top-level model > config model
             task_model = creds.get("model")
             task_provider = creds.get("provider")
+            task_base_url = creds.get("base_url")
+            task_api_mode = creds.get("api_mode")
+            task_api_key = creds.get("api_key")
+
+            # Legacy per-task model dict (back-compat)
             pt_model = t.get("model")
             if pt_model and isinstance(pt_model, dict) and pt_model.get("model"):
                 task_model = pt_model["model"]
                 if pt_model.get("provider"):
                     task_provider = pt_model["provider"]
+
+            # New per-task string params (per #35437) — beat legacy dict
+            if t.get("model_name"):
+                task_model = t["model_name"]
+            if t.get("provider"):
+                task_provider = t["provider"]
+            if t.get("base_url"):
+                task_base_url = t["base_url"]
+            if t.get("api_format"):
+                try:
+                    task_api_mode = _api_format_to_mode(t["api_format"])
+                except ValueError as exc:
+                    return tool_error(
+                        f"Task {i}: {exc}"
+                    )
+            if t.get("api_key"):
+                task_api_key = t["api_key"]
+
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2088,9 +2138,9 @@ def delegate_task(
                 task_count=n_tasks,
                 parent_agent=parent_agent,
                 override_provider=task_provider,
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
+                override_base_url=task_base_url,
+                override_api_key=task_api_key,
+                override_api_mode=task_api_mode,
                 override_acp_command=t.get("acp_command")
                 or acp_command
                 or creds.get("command"),
@@ -2360,6 +2410,30 @@ def _resolve_child_credential_pool(effective_provider: Optional[str], parent_age
             exc,
         )
     return None
+
+
+def _api_format_to_mode(api_format: str) -> str:
+    """Map user-facing api_format string to internal api_mode value.
+
+    Accepts common aliases (case-insensitive) and returns the canonical
+    mode string used by the runtime provider system.
+    """
+    mapping = {
+        "openai": "chat_completions",
+        "chat_completions": "chat_completions",
+        "anthropic": "anthropic_messages",
+        "anthropic_messages": "anthropic_messages",
+        "codex": "codex_responses",
+        "codex_responses": "codex_responses",
+    }
+    normalized = api_format.strip().lower()
+    result = mapping.get(normalized)
+    if result is None:
+        raise ValueError(
+            f"Unknown api_format '{api_format}'. "
+            f"Valid options: {', '.join(sorted(mapping.keys()))}"
+        )
+    return result
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -2756,6 +2830,48 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Per-task provider override (e.g. 'openrouter', 'anthropic', "
+                                "'custom:<name>', 'claude-code-acp'). Beats top-level provider "
+                                "and delegation config. Leave empty to inherit."
+                            ),
+                        },
+                        "model_name": {
+                            "type": "string",
+                            "description": (
+                                "Per-task model string override (e.g. 'claude-sonnet-4-6'). "
+                                "Beats top-level model_name and delegation config. "
+                                "Leave empty to inherit."
+                            ),
+                        },
+                        "base_url": {
+                            "type": "string",
+                            "description": (
+                                "Per-task API base URL override (e.g. "
+                                "'https://openrouter.ai/api/v1'). Beats top-level base_url "
+                                "and delegation config. Leave empty to inherit."
+                            ),
+                        },
+                        "api_format": {
+                            "type": "string",
+                            "enum": ["openai", "anthropic", "codex"],
+                            "description": (
+                                "Per-task API format override. "
+                                "'openai' = OpenAI chat completions, "
+                                "'anthropic' = Anthropic Messages, "
+                                "'codex' = OpenAI Codex responses. "
+                                "Beats top-level api_format and delegation config."
+                            ),
+                        },
+                        "api_key": {
+                            "type": "string",
+                            "description": (
+                                "Per-task API key override. Beats top-level api_key "
+                                "and delegation config. Leave empty to inherit."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2791,6 +2907,52 @@ DELEGATE_TASK_SCHEMA = {
                     "Leave empty unless acp_command is explicitly provided."
                 ),
             },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Per-call provider override for all child agents "
+                    "(e.g. 'openrouter', 'anthropic', 'custom:<name>', "
+                    "'claude-code-acp'). Beats delegation config and "
+                    "parent inheritance. Per-task provider beats this."
+                ),
+            },
+            "model_name": {
+                "type": "string",
+                "description": (
+                    "Per-call model string override for all child agents "
+                    "(e.g. 'claude-sonnet-4-6'). Beats delegation config "
+                    "and parent inheritance. Per-task model_name beats this. "
+                    "Preferred over the legacy 'model' dict parameter."
+                ),
+            },
+            "base_url": {
+                "type": "string",
+                "description": (
+                    "Per-call API base URL override for all child agents "
+                    "(e.g. 'https://openrouter.ai/api/v1'). Beats delegation "
+                    "config and parent inheritance. Per-task base_url beats this."
+                ),
+            },
+            "api_format": {
+                "type": "string",
+                "enum": ["openai", "anthropic", "codex"],
+                "description": (
+                    "Per-call API format override. "
+                    "'openai' = OpenAI chat completions, "
+                    "'anthropic' = Anthropic Messages, "
+                    "'codex' = OpenAI Codex responses. "
+                    "Beats delegation config. Per-task api_format beats this."
+                ),
+            },
+            "api_key": {
+                "type": "string",
+                "description": (
+                    "Per-call API key override for all child agents. "
+                    "Beats delegation config and parent inheritance. "
+                    "Per-task api_key beats this. Prefer env vars over "
+                    "passing keys in tool calls."
+                ),
+            },
         },
         "required": [],
     },
@@ -2814,6 +2976,11 @@ registry.register(
         acp_args=args.get("acp_args"),
         role=args.get("role"),
         model=args.get("model"),
+        provider=args.get("provider"),
+        model_name=args.get("model_name"),
+        base_url=args.get("base_url"),
+        api_format=args.get("api_format"),
+        api_key=args.get("api_key"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
