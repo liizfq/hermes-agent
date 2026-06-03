@@ -1929,9 +1929,8 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
-    model: Optional[Dict[str, str]] = None,
+    model: Optional[str] = None,
     provider: Optional[str] = None,
-    model_name: Optional[str] = None,
     base_url: Optional[str] = None,
     api_format: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -1949,12 +1948,10 @@ def delegate_task(
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
 
-    Per-call credential parameters (provider, model_name, base_url,
+    Per-call credential parameters (model, provider, base_url,
     api_format, api_key) override delegation config and parent
-    inheritance.  Per-task overrides in tasks[].{provider, model_name,
-    ...} beat per-call overrides.  The legacy ``model: Dict[str, str]``
-    parameter is preserved for backward compatibility; prefer the new
-    string ``model_name`` parameter for new code.
+    inheritance.  Per-task overrides in tasks[].{model, provider, ...}
+    beat per-call overrides.
 
     Returns JSON with results array, one entry per task.
     """
@@ -2015,15 +2012,9 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
-    # Caller-supplied model override (per-task or top-level) beats config
-    if model and isinstance(model, dict) and model.get("model"):
-        creds["model"] = model["model"]
-        if model.get("provider"):
-            creds["provider"] = model["provider"]
-
-    # New per-call string params (per #35437) — beat legacy dict when set
-    if model_name:
-        creds["model"] = model_name
+    # Per-call string params (per #35437) override config and parent inheritance
+    if model:
+        creds["model"] = model
     if provider:
         creds["provider"] = provider
     if base_url:
@@ -2097,23 +2088,15 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
-            # Per-task model override beats top-level model > config model
+            # Per-task overrides (per #35437) beat per-call overrides
             task_model = creds.get("model")
             task_provider = creds.get("provider")
             task_base_url = creds.get("base_url")
             task_api_mode = creds.get("api_mode")
             task_api_key = creds.get("api_key")
 
-            # Legacy per-task model dict (back-compat)
-            pt_model = t.get("model")
-            if pt_model and isinstance(pt_model, dict) and pt_model.get("model"):
-                task_model = pt_model["model"]
-                if pt_model.get("provider"):
-                    task_provider = pt_model["provider"]
-
-            # New per-task string params (per #35437) — beat legacy dict
-            if t.get("model_name"):
-                task_model = t["model_name"]
+            if t.get("model"):
+                task_model = t["model"]
             if t.get("provider"):
                 task_provider = t["provider"]
             if t.get("base_url"):
@@ -2838,11 +2821,11 @@ DELEGATE_TASK_SCHEMA = {
                                 "and delegation config. Leave empty to inherit."
                             ),
                         },
-                        "model_name": {
+                        "model": {
                             "type": "string",
                             "description": (
-                                "Per-task model string override (e.g. 'claude-sonnet-4-6'). "
-                                "Beats top-level model_name and delegation config. "
+                                "Per-task model override (e.g. 'claude-sonnet-4-6'). "
+                                "Beats top-level model and delegation config. "
                                 "Leave empty to inherit."
                             ),
                         },
@@ -2916,13 +2899,12 @@ DELEGATE_TASK_SCHEMA = {
                     "parent inheritance. Per-task provider beats this."
                 ),
             },
-            "model_name": {
+            "model": {
                 "type": "string",
                 "description": (
                     "Per-call model string override for all child agents "
                     "(e.g. 'claude-sonnet-4-6'). Beats delegation config "
-                    "and parent inheritance. Per-task model_name beats this. "
-                    "Preferred over the legacy 'model' dict parameter."
+                    "and parent inheritance. Per-task model beats this."
                 ),
             },
             "base_url": {
@@ -2977,7 +2959,6 @@ registry.register(
         role=args.get("role"),
         model=args.get("model"),
         provider=args.get("provider"),
-        model_name=args.get("model_name"),
         base_url=args.get("base_url"),
         api_format=args.get("api_format"),
         api_key=args.get("api_key"),
