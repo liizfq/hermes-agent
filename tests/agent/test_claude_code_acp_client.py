@@ -73,15 +73,15 @@ class TestNormalizeModelName(unittest.TestCase):
         self.assertEqual(ClaudeCodeACPClient._normalize_model_name("Opus"), "opus")
         self.assertEqual(ClaudeCodeACPClient._normalize_model_name("SONNET"), "sonnet")
 
-    def test_full_names_reduce_to_short(self):
-        self.assertEqual(ClaudeCodeACPClient._normalize_model_name("claude-opus-4-7"), "opus")
-        self.assertEqual(ClaudeCodeACPClient._normalize_model_name("claude-sonnet-4-6"), "sonnet")
-        self.assertEqual(ClaudeCodeACPClient._normalize_model_name("claude-haiku-4-5"), "haiku")
+    def test_full_names_pass_through_verbatim(self):
+        self.assertEqual(ClaudeCodeACPClient._normalize_model_name("claude-opus-4-7"), "claude-opus-4-7")
+        self.assertEqual(ClaudeCodeACPClient._normalize_model_name("claude-sonnet-4-6"), "claude-sonnet-4-6")
+        self.assertEqual(ClaudeCodeACPClient._normalize_model_name("claude-haiku-4-5"), "claude-haiku-4-5")
 
     def test_context_window_suffixes_stripped(self):
         self.assertEqual(ClaudeCodeACPClient._normalize_model_name("opus[1m]"), "opus")
         self.assertEqual(ClaudeCodeACPClient._normalize_model_name("sonnet[200k]"), "sonnet")
-        self.assertEqual(ClaudeCodeACPClient._normalize_model_name("claude-opus-4-7[1m]"), "opus")
+        self.assertEqual(ClaudeCodeACPClient._normalize_model_name("claude-opus-4-7[1m]"), "claude-opus-4-7")
 
     def test_empty_passthrough(self):
         self.assertEqual(ClaudeCodeACPClient._normalize_model_name(""), "")
