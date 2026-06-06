@@ -479,5 +479,94 @@ class TestCloseCleanup(unittest.TestCase):
         self.assertIsNone(client._active_process)
 
 
+# ===========================================================================
+# 13. _is_valid_effort_level
+# ===========================================================================
+class TestIsValidEffortLevel(unittest.TestCase):
+    def test_valid_levels(self):
+        client = _make_client()
+        for level in ("default", "low", "medium", "high", "xhigh", "max"):
+            self.assertTrue(
+                client._is_valid_effort_level(level),
+                f"{level} should be valid",
+            )
+
+    def test_case_insensitive(self):
+        client = _make_client()
+        self.assertTrue(client._is_valid_effort_level("High"))
+        self.assertTrue(client._is_valid_effort_level("DEFAULT"))
+
+    def test_invalid_level(self):
+        client = _make_client()
+        self.assertFalse(client._is_valid_effort_level("turbo"))
+        self.assertFalse(client._is_valid_effort_level("extreme"))
+
+
+# ===========================================================================
+# 14. _apply_acp_arg_directives
+# ===========================================================================
+class TestApplyAcpArgDirectives(unittest.TestCase):
+    def test_model_flag_seeds_pending(self):
+        client = _make_client(acp_args=["--model", "opus", "--stdio"])
+        client._apply_acp_arg_directives()
+        self.assertEqual(client._pending_model, "opus")
+        self.assertEqual(client._pending_session_configs.get("model"), "opus")
+
+    def test_model_flag_invalid_ignored(self):
+        client = _make_client(acp_args=["--model", "gpt-4o", "--stdio"])
+        client._apply_acp_arg_directives()
+        self.assertIsNone(client._pending_model)
+        self.assertNotIn("model", client._pending_session_configs)
+
+    def test_permission_mode_flag(self):
+        client = _make_client(acp_args=["--permission-mode", "plan", "--stdio"])
+        client._apply_acp_arg_directives()
+        self.assertEqual(client._pending_session_configs.get("mode"), "plan")
+
+    def test_effort_flag(self):
+        client = _make_client(acp_args=["--effort", "high", "--stdio"])
+        client._apply_acp_arg_directives()
+        self.assertEqual(client._pending_session_configs.get("effort"), "high")
+
+    def test_effort_flag_invalid_ignored(self):
+        client = _make_client(acp_args=["--effort", "turbo", "--stdio"])
+        client._apply_acp_arg_directives()
+        self.assertNotIn("effort", client._pending_session_configs)
+
+    def test_multiple_directives(self):
+        client = _make_client(
+            acp_args=["--model", "sonnet", "--permission-mode", "auto", "--effort", "low", "--stdio"]
+        )
+        client._apply_acp_arg_directives()
+        self.assertEqual(client._pending_model, "sonnet")
+        self.assertEqual(client._pending_session_configs["model"], "sonnet")
+        self.assertEqual(client._pending_session_configs["mode"], "auto")
+        self.assertEqual(client._pending_session_configs["effort"], "low")
+
+    def test_unrecognized_flag_passthrough(self):
+        args = ["--debug", "--model", "haiku", "--unknown", "val", "--stdio"]
+        client = _make_client(acp_args=args)
+        client._apply_acp_arg_directives()
+        # acp_args should be unchanged
+        self.assertEqual(client._acp_args, args)
+        self.assertEqual(client._pending_model, "haiku")
+
+    def test_duplicate_flag_first_wins(self):
+        client = _make_client(acp_args=["--model", "opus", "--model", "haiku", "--stdio"])
+        client._apply_acp_arg_directives()
+        self.assertEqual(client._pending_model, "opus")
+
+    def test_model_flag_no_value_skipped(self):
+        client = _make_client(acp_args=["--model"])
+        client._apply_acp_arg_directives()
+        self.assertIsNone(client._pending_model)
+
+    def test_empty_acp_args(self):
+        client = _make_client(acp_args=[])
+        client._apply_acp_arg_directives()
+        self.assertIsNone(client._pending_model)
+        self.assertEqual(client._pending_session_configs, {})
+
+
 if __name__ == "__main__":
     unittest.main()

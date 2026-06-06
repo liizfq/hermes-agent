@@ -34,7 +34,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Iterable, Iterator, List, Optional
+from typing import Any, Callable, ClassVar, Iterable, Iterator, List, Optional
 
 from agent.file_safety import get_read_block_error, is_write_denied
 from gateway.session_context import get_session_env
@@ -393,6 +393,18 @@ class ClaudeCodeACPClient:
     issues ``initialize`` + ``session/new``, and caches the ``sessionId``.
     Subsequent calls reuse the same subprocess and session — mirroring the
     Claude Code editor lifetime.
+
+    Supported ``acp_args`` directives (queued during ``__init__``, flushed
+    via ``session/set_config_option`` after ``session/new``):
+
+    * ``--model <name>`` — set Claude model (opus/sonnet/haiku or full name)
+    * ``--permission-mode <mode>`` — set permission mode (auto/default/
+      acceptEdits/plan/dontAsk/bypassPermissions)
+    * ``--effort <level>`` — set reasoning effort (default/low/medium/high/
+      xhigh/max)
+
+    Unrecognised flags are left in ``acp_args`` and passed through to the
+    ACP subprocess (which silently ignores unknown CLI arguments).
     """
 
     _provider_label = "claude-code-acp"
@@ -403,6 +415,42 @@ class ClaudeCodeACPClient:
     _marker_base_url = ACP_MARKER_BASE_URL
     _default_timeout_seconds = _DEFAULT_TIMEOUT_SECONDS
     _client_name = "hermes-agent"
+
+    # Declarative dispatch table: maps recognized CLI flags from acp_args
+    # to their ACP session config actions. Each entry defines:
+    #   flag: the CLI flag to match (e.g. "--model")
+    #   channel: "session_config" (via session/set_config_option) or "init"
+    #   config_id: the ACP configId for session_config channel entries
+    #   attr: the instance attribute to set for init channel entries
+    #   takes_value: True if the flag consumes the next token as its value
+    #   validate: optional method name (str) for value validation; None = trust caller
+    #   repeatable: if False, only the first occurrence is honoured
+    _ACP_ARG_DIRECTIVES: ClassVar[tuple[dict[str, Any], ...]] = (
+        {
+            "flag": "--model",
+            "channel": "session_config",
+            "config_id": "model",
+            "takes_value": True,
+            "validate": "_is_valid_claude_alias",
+            "repeatable": False,
+        },
+        {
+            "flag": "--permission-mode",
+            "channel": "session_config",
+            "config_id": "mode",
+            "takes_value": True,
+            "validate": None,  # ACP server validates: auto/default/acceptEdits/plan/dontAsk/bypassPermissions
+            "repeatable": False,
+        },
+        {
+            "flag": "--effort",
+            "channel": "session_config",
+            "config_id": "effort",
+            "takes_value": True,
+            "validate": "_is_valid_effort_level",
+            "repeatable": False,
+        },
+    )
 
     def __init__(
         self,
@@ -463,17 +511,14 @@ class ClaudeCodeACPClient:
         self._session_id: str | None = None
         self._sandbox_path: Path | None = None
         self._pending_model: str | None = None
+        self._pending_session_configs: dict[str, str] = {}
 
-        # Seed _pending_model from --model flag in acp_args so the subprocess
-        # uses the requested model even when the calling LLM doesn't pass a
-        # per-call model parameter. The session/new → session/set_config_option
-        # flow in _ensure_session() will route this to claude-agent-acp's
-        # query.setModel() on the first _create_chat_completion call. This is
-        # necessary because the underlying @agentclientprotocol/claude-agent-acp
-        # subprocess silently ignores all CLI args except --cli/--version/
-        # --help/--debug, so the model flag has to flow through ACP's
-        # set_config_option channel rather than argv.
-        self._seed_pending_model_from_acp_args()
+        # Scan acp_args for recognized directive flags (--model, --permission-mode,
+        # --effort) and queue them into _pending_session_configs.  These are
+        # flushed via session/set_config_option after session/new in
+        # _ensure_session().  Unrecognised flags remain in acp_args and are
+        # passed to the subprocess (which silently ignores them).
+        self._apply_acp_arg_directives()
 
         self._trace_lock = threading.Lock()
         self._tool_trace: list[ToolCallRecord] = []
@@ -929,23 +974,30 @@ class ClaudeCodeACPClient:
                     raise RuntimeError(
                         "claude-agent-acp did not return a sessionId from session/new."
                     )
-                if self._pending_model:
+                # Flush all pending session configs from directive scanner.
+                # Order matters: model MUST be flushed first because switching
+                # models can invalidate subsequent mode/effort settings
+                # (e.g. Haiku does not support auto mode).
+                _FLUSH_ORDER = ("model", "mode", "effort")
+                for config_id in _FLUSH_ORDER:
+                    if config_id not in self._pending_session_configs:
+                        continue
                     try:
                         self._request(
                             proc, inbox, stderr_tail,
                             "session/set_config_option",
                             {
                                 "sessionId": session_id,
-                                "configId": "model",
-                                "value": self._pending_model,
+                                "configId": config_id,
+                                "value": self._pending_session_configs[config_id],
                             },
                             timeout_seconds=self._default_timeout_seconds,
                         )
                     except Exception as exc:
                         logger.warning(
-                            "Failed to set model via session/set_config_option (%s: %r); "
-                            "falling back to user default",
-                            type(exc).__name__, exc,
+                            "Failed to set %s via session/set_config_option "
+                            "(%s: %r); continuing",
+                            config_id, type(exc).__name__, exc,
                         )
             except Exception:
                 try:
@@ -1184,42 +1236,83 @@ class ClaudeCodeACPClient:
             return True
         return False
 
-    def _seed_pending_model_from_acp_args(self) -> None:
-        """Seed ``_pending_model`` from a ``--model`` flag in ``self._acp_args``.
+    def _is_valid_effort_level(self, value: str) -> bool:
+        """Return True if *value* is a valid ACP effort level.
 
-        Allows callers to pin the Claude model via the CLI-level ``--model``
-        flag in ``acp_args`` (e.g. ``["--acp", "--stdio", "--model",
-        "claude-sonnet-4-6"]``) even when the calling LLM skips the per-call
-        ``model`` tool parameter. The model is consumed by the existing
-        ``_ensure_session()`` flow which calls
-        ``session/set_config_option({"configId": "model", ...})`` after
-        ``session/new`` — claude-agent-acp routes that to
-        ``query.setModel(resolvedValue)`` on the live SDK query.
-
-        The ``--model`` token is left in ``self._acp_args`` because the
-        underlying ``@agentclientprotocol/claude-agent-acp`` subprocess
-        silently ignores all unknown CLI args, so there's no benefit (and
-        some debugging value) in stripping it.
+        Valid values (from @agentclientprotocol/claude-agent-acp buildConfigOptions):
+        default, low, medium, high, xhigh, max
         """
-        for i, arg in enumerate(self._acp_args):
-            if arg == "--model" and i + 1 < len(self._acp_args):
-                candidate = self._acp_args[i + 1]
-                if self._is_valid_claude_alias(candidate):
-                    self._pending_model = candidate
+        return value.lower() in ("default", "low", "medium", "high", "xhigh", "max")
+
+    def _apply_acp_arg_directives(self) -> None:
+        """Scan ``self._acp_args`` for recognized flags and queue them.
+
+        Each matched flag is queued into ``_pending_session_configs`` (for
+        ``session_config`` channel directives).  Unrecognised flags are
+        left in ``self._acp_args`` — the ACP subprocess silently ignores
+        unknown CLI arguments.
+
+        Only the first occurrence of each non-repeatable flag is honoured.
+        """
+        recognized_flags = {d["flag"]: d for d in self._ACP_ARG_DIRECTIVES}
+        seen: set[str] = set()
+        i = 0
+        while i < len(self._acp_args):
+            arg = self._acp_args[i]
+            if arg not in recognized_flags:
+                i += 1
+                continue
+            directive = recognized_flags[arg]
+
+            # Skip duplicate non-repeatable flags
+            if not directive.get("repeatable", False) and arg in seen:
+                i += (2 if directive["takes_value"] else 1)
+                continue
+            seen.add(arg)
+
+            if directive["takes_value"]:
+                if i + 1 >= len(self._acp_args):
+                    logger.warning(
+                        "ClaudeCodeACPClient: %s flag has no value, skipping",
+                        arg,
+                    )
+                    i += 1
+                    continue
+                value = self._acp_args[i + 1]
+            else:
+                value = "true"  # boolean flag
+
+            # Validate if a validator is specified
+            validator_name = directive.get("validate")
+            if validator_name:
+                validator = getattr(self, validator_name, None)
+                if validator and not validator(value):
+                    logger.warning(
+                        "ClaudeCodeACPClient: ignoring %s=%r — validation failed",
+                        arg,
+                        value,
+                    )
+                    i += (2 if directive["takes_value"] else 1)
+                    continue
+
+            # Dispatch to the appropriate channel
+            channel = directive["channel"]
+            if channel == "session_config":
+                config_id = directive["config_id"]
+                self._pending_session_configs[config_id] = value
+                # Backward compat: also set _pending_model for --model
+                if config_id == "model":
+                    self._pending_model = value
                     logger.info(
                         "ClaudeCodeACPClient: seeded _pending_model=%r from "
                         "acp_args --model flag",
-                        candidate,
+                        value,
                     )
-                else:
-                    logger.warning(
-                        "ClaudeCodeACPClient: ignoring --model=%r from "
-                        "acp_args: not a valid Claude alias (expected "
-                        "opus/sonnet/haiku or claude-{opus,sonnet,haiku}-*)",
-                        candidate,
-                    )
-                # Only honor the first --model flag
-                return
+            elif channel == "init":
+                attr = directive["attr"]
+                setattr(self, attr, value)
+
+            i += (2 if directive["takes_value"] else 1)
 
     def _create_chat_completion(
         self,
@@ -1251,6 +1344,7 @@ class ClaudeCodeACPClient:
 
         if raw_model and self._is_valid_claude_alias(raw_model):
             self._pending_model = raw_model
+            self._pending_session_configs["model"] = raw_model
 
         proc, inbox, stderr_tail, session_id = self._ensure_session()
 
