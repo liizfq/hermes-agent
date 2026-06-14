@@ -21,6 +21,7 @@ inputs' mtimes + sizes so unchanged sandboxes skip rebuild.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -29,6 +30,7 @@ import re
 import shutil
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -47,6 +49,84 @@ _CLAUDE_MCP_TOOL_PREFIX = "mcp__hermes_tools__"
 from agent.claude_code_acp_client import CLAUDE_SYSTEM_PREAMBLE_LINES as _SHARED_PREAMBLE_LINES
 
 _PREAMBLE = "\n\n".join(_SHARED_PREAMBLE_LINES)
+
+
+@dataclass(frozen=True)
+class SandboxComponents:
+    """设计期固定的组件包含决策,运行时不再推导。
+
+    默认值(全 True)匹配当前 primary-agent 行为——SOUL.md / memory / skills /
+    .mcp.json / toolbelt / platform block / settings.local.json 全部启用。
+    各 preset 按 feature 组合命名(不按 caller 名字),复用 3 个真实存在的
+    AIAgent flag(skip_context_files / load_soul_identity / skip_memory)推导。
+
+    These flags are read by the inner helpers via the ``include=`` keyword
+    argument — see :func:`_load_soul`, :func:`_build_memory_block`,
+    :func:`_flatten_skills_into`, :func:`_write_mcp_json`.
+    """
+
+    include_soul: bool = True
+    include_memory: bool = True
+    include_skills: bool = True
+    include_mcp: bool = True
+    include_toolbelt: bool = True
+    include_platform: bool = True
+    include_settings: bool = True
+
+
+SANDBOX_PRESETS: Dict[str, SandboxComponents] = {
+    # Full primary sandbox — all components enabled.
+    "primary": SandboxComponents(
+        include_soul=True, include_memory=True, include_skills=True,
+        include_mcp=True, include_toolbelt=True, include_platform=True,
+        include_settings=True,
+    ),
+    # Primary minus memory block (background_review, cron-with-workdir).
+    "primary_minus_memory": SandboxComponents(
+        include_soul=True, include_memory=False, include_skills=True,
+        include_mcp=True, include_toolbelt=True, include_platform=True,
+        include_settings=True,
+    ),
+    # Subagent / curator / ignore_rules / feishu_comment — only preamble +
+    # toolbelt + platform + settings + mcp (mcp 永远保留:subagent 需要找
+    # hermes 工具)。SOUL/memory/skills 全跳过。
+    "minimal": SandboxComponents(
+        include_soul=False, include_memory=False, include_skills=False,
+        include_mcp=True, include_toolbelt=True, include_platform=True,
+        include_settings=True,
+    ),
+    # Cron-no-workdir — 保留 SOUL(尊重 load_soul_identity 契约)+ skills +
+    # mcp(同上) + toolbelt/platform/settings,跳过 memory(cron 永远 skip)。
+    "cron_no_workdir": SandboxComponents(
+        include_soul=True, include_memory=False, include_skills=True,
+        include_mcp=True, include_toolbelt=True, include_platform=True,
+        include_settings=True,
+    ),
+}
+
+
+def _resolve_preset(agent: Any) -> str:
+    """纯推导:复用 agent 现有的 3 个 flag,不引入新属性。
+
+    重要:原版的 is_subagent / is_curator / is_background_review / is_cron
+    在代码里根本不存在(rg 0 hits),不能用。这里只用
+    skip_context_files / load_soul_identity / skip_memory 三个真实存在的
+    flag → callsite 真正零改动。
+    """
+    skip_ctx = bool(getattr(agent, "skip_context_files", False))
+    load_soul = bool(getattr(agent, "load_soul_identity", False))
+    skip_mem = bool(getattr(agent, "skip_memory", False))
+
+    if not skip_ctx and not skip_mem:
+        return "primary"
+    if not skip_ctx and skip_mem:
+        return "primary_minus_memory"
+    if skip_ctx and load_soul and skip_mem:
+        # 同时覆盖 cron-no-workdir 和未来的 subagent_with_soul (YAGNI)
+        return "cron_no_workdir"
+    if skip_ctx and not load_soul and skip_mem:
+        return "minimal"
+    return "primary"  # 兜底,理论上到不了
 
 
 # ---------------------------------------------------------------------------
@@ -116,11 +196,14 @@ def _write_settings_local(sandbox: Path, *, model: Optional[str] = None) -> None
 def _write_mcp_json(
     sandbox: Path,
     *,
+    include: bool = True,
     session_id: str,
     hermes_home: Path,
     platform: Optional[str],
 ) -> None:
     """Materialize ``.mcp.json`` pointing Claude Code at hermes's MCP servers."""
+    if not include:
+        return
     (sandbox / ".mcp.json").write_text(
         json.dumps(
             _build_mcp_config(
@@ -398,8 +481,10 @@ def _build_toolbelt_hint(tool_names: List[str]) -> str:
     return "\n".join(lines)
 
 
-def _build_memory_block(agent: Any) -> Optional[str]:
+def _build_memory_block(agent: Any, *, include: bool = True) -> Optional[str]:
     """Build the memory-context block via the same code path the AIAgent uses."""
+    if not include:
+        return None
     try:
         from agent.memory_manager import build_memory_context_block
     except Exception:
@@ -482,7 +567,9 @@ def _build_platform_block(platform: Optional[str]) -> Optional[str]:
     return "\n".join(lines)
 
 
-def _load_soul(hermes_home: Path) -> Optional[str]:
+def _load_soul(hermes_home: Path, *, include: bool = True) -> Optional[str]:
+    if not include:
+        return None
     path = hermes_home / "SOUL.md"
     if not path.exists():
         return None
@@ -555,10 +642,11 @@ def _unique_slug(
 
 def _flatten_skills_into(
     *,
+    include: bool = True,
     hermes_home: Path,
     target: Path,
-    available_tools: Optional[set[str]],
-    available_toolsets: Optional[set[str]],
+    available_tools: Optional[set[str]] = None,
+    available_toolsets: Optional[set[str]] = None,
 ) -> int:
     """Copy each enabled hermes skill into ``<target>/<skill_name>/`` flat.
 
@@ -566,7 +654,13 @@ def _flatten_skills_into(
     ``.claude/skills/``); hermes skills can nest. For each enabled skill,
     we slug its frontmatter name and copy the source directory. Returns
     the number of skills copied.
+
+    ``include=False`` short-circuits the work entirely and returns ``0``,
+    which keeps the sandbox manifest digest stable while letting callers
+    skip the (potentially expensive) skills glob + copy.
     """
+    if not include:
+        return 0
     try:
         from agent.skill_utils import (
             iter_skill_index_files,
@@ -671,7 +765,11 @@ def _build_mcp_config(
 
 
 def _collect_manifest_inputs(
-    *, hermes_home: Path, platform: Optional[str], model: Optional[str] = None,
+    *,
+    hermes_home: Path,
+    platform: Optional[str],
+    model: Optional[str] = None,
+    components: Optional[SandboxComponents] = None,
 ) -> Dict[str, Any]:
     """Return a dict whose hash captures everything that affects the sandbox."""
     items: Dict[str, Any] = {
@@ -705,6 +803,12 @@ def _collect_manifest_inputs(
     if config.exists():
         st = config.stat()
         items["config"] = {"mtime": st.st_mtime, "size": st.st_size}
+    # When components is provided, fold it into the digest so changing the
+    # preset invalidates the manifest. When omitted (the current default for
+    # every call site in ``build_session_sandbox``), the digest is identical
+    # to the pre-commit-1 shape — existing sandbox caches stay valid.
+    if components is not None:
+        items["components"] = dataclasses.asdict(components)
     return items
 
 
