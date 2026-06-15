@@ -950,6 +950,37 @@ class ClaudeCodeACPClient:
             out.append(entry)
         return out
 
+    def _flush_pending_configs(
+        self, proc, inbox, stderr_tail, session_id: str
+    ) -> None:
+        """Flush pending session configs via session/set_config_option.
+
+        Order matters: model MUST be flushed first because switching
+        models can invalidate subsequent mode/effort settings
+        (e.g. Haiku does not support auto mode).
+        """
+        _FLUSH_ORDER = ("model", "mode", "effort")
+        for config_id in _FLUSH_ORDER:
+            if config_id not in self._pending_session_configs:
+                continue
+            try:
+                self._request(
+                    proc, inbox, stderr_tail,
+                    "session/set_config_option",
+                    {
+                        "sessionId": session_id,
+                        "configId": config_id,
+                        "value": self._pending_session_configs[config_id],
+                    },
+                    timeout_seconds=self._default_timeout_seconds,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to set %s via session/set_config_option "
+                    "(%s: %r); continuing",
+                    config_id, type(exc).__name__, exc,
+                )
+
     def _ensure_session(self) -> tuple[
         subprocess.Popen[str],
         "queue.Queue[dict[str, Any]]",
@@ -964,6 +995,11 @@ class ClaudeCodeACPClient:
                 and self._session_inbox is not None
                 and self._session_stderr is not None
             ):
+                # Flush any pending config changes before reusing the live session
+                self._flush_pending_configs(
+                    self._session_proc, self._session_inbox,
+                    self._session_stderr, self._session_id,
+                )
                 return (
                     self._session_proc,
                     self._session_inbox,
@@ -989,31 +1025,7 @@ class ClaudeCodeACPClient:
                     raise RuntimeError(
                         "claude-agent-acp did not return a sessionId from session/new."
                     )
-                # Flush all pending session configs from directive scanner.
-                # Order matters: model MUST be flushed first because switching
-                # models can invalidate subsequent mode/effort settings
-                # (e.g. Haiku does not support auto mode).
-                _FLUSH_ORDER = ("model", "mode", "effort")
-                for config_id in _FLUSH_ORDER:
-                    if config_id not in self._pending_session_configs:
-                        continue
-                    try:
-                        self._request(
-                            proc, inbox, stderr_tail,
-                            "session/set_config_option",
-                            {
-                                "sessionId": session_id,
-                                "configId": config_id,
-                                "value": self._pending_session_configs[config_id],
-                            },
-                            timeout_seconds=self._default_timeout_seconds,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to set %s via session/set_config_option "
-                            "(%s: %r); continuing",
-                            config_id, type(exc).__name__, exc,
-                        )
+                self._flush_pending_configs(proc, inbox, stderr_tail, session_id)
             except Exception:
                 try:
                     proc.terminate()
