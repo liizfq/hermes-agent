@@ -522,7 +522,6 @@ class ClaudeCodeACPClient:
         self._session_stderr: deque[str] | None = None
         self._session_id: str | None = None
         self._sandbox_path: Path | None = None
-        self._pending_model: str | None = None
         self._pending_session_configs: dict[str, str] = {}
 
         # Scan _acp_args (runtime directives from caller) for recognized
@@ -912,7 +911,7 @@ class ClaudeCodeACPClient:
             platform=self._platform,
             available_tools=self._available_tools,
             available_toolsets=self._available_toolsets,
-            model=model or self._pending_model,
+            model=model or self._pending_session_configs.get("model"),
         )
         # ACP subprocess must cd into the sandbox so .mcp.json and CLAUDE.md
         # are picked up.
@@ -1327,14 +1326,6 @@ class ClaudeCodeACPClient:
             if channel == "session_config":
                 config_id = directive["config_id"]
                 self._pending_session_configs[config_id] = value
-                # Backward compat: also set _pending_model for --model
-                if config_id == "model":
-                    self._pending_model = value
-                    logger.info(
-                        "ClaudeCodeACPClient: seeded _pending_model=%r from "
-                        "acp_args --model flag",
-                        value,
-                    )
             elif channel == "init":
                 attr = directive["attr"]
                 setattr(self, attr, value)
@@ -1370,7 +1361,6 @@ class ClaudeCodeACPClient:
         )
 
         if raw_model and self._is_valid_claude_alias(raw_model):
-            self._pending_model = raw_model
             self._pending_session_configs["model"] = raw_model
 
         proc, inbox, stderr_tail, session_id = self._ensure_session()
