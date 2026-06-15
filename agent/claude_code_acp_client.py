@@ -496,6 +496,7 @@ class ClaudeCodeACPClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        self._reader_threads: list[threading.Thread] = []
         self._next_request_id = 0
         self._stderr_log_path: Optional[Path] = None
 
@@ -578,6 +579,15 @@ class ClaudeCodeACPClient:
                 proc.kill()
             except (OSError, ProcessLookupError):
                 pass
+        # Reader threads may still be mid-readline on the now-closed pipes.
+        # Join with a short timeout so they can drain/EOF cleanly before close()
+        # returns; daemon=True ensures the process can't hang on shutdown.
+        for t in self._reader_threads:
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass
+        self._reader_threads = []
         self.is_closed = True
 
     def _start_subprocess(self) -> tuple[subprocess.Popen[str], "queue.Queue[dict[str, Any]]", deque[str]]:
@@ -644,8 +654,11 @@ class ClaudeCodeACPClient:
                     except OSError:
                         pass
 
-        threading.Thread(target=_stdout_reader, daemon=True).start()
-        threading.Thread(target=_stderr_reader, daemon=True).start()
+        t_out = threading.Thread(target=_stdout_reader, daemon=True)
+        t_err = threading.Thread(target=_stderr_reader, daemon=True)
+        t_out.start()
+        t_err.start()
+        self._reader_threads = [t_out, t_err]
         return proc, inbox, stderr_tail
 
     # ------------------------------------------------------------------
