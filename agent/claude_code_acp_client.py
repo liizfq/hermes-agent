@@ -565,11 +565,12 @@ class ClaudeCodeACPClient:
             self._session_id = None
             self._session_inbox = None
             self._session_stderr = None
+            self._session_proc = None
         with self._active_process_lock:
             proc = self._active_process
             self._active_process = None
-        self.is_closed = True
         if proc is None:
+            self.is_closed = True
             return
         try:
             proc.terminate()
@@ -579,7 +580,7 @@ class ClaudeCodeACPClient:
                 proc.kill()
             except (OSError, ProcessLookupError):
                 pass
-        self._session_proc = None
+        self.is_closed = True
 
     def _start_subprocess(self) -> tuple[subprocess.Popen[str], "queue.Queue[dict[str, Any]]", deque[str]]:
         """Launch the ACP subprocess and start reader threads.
