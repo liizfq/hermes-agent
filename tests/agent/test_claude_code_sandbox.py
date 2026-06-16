@@ -92,5 +92,43 @@ class TestSandboxPresetsUniqueness(unittest.TestCase):
         self.assertEqual(_resolve_preset(agent), "primary_minus_memory")
 
 
+
+
+# ===========================================================================
+# B2 (b5a4dd6c1) — Iterable import regression guard
+# B3 (b5a4dd6c1) — init channel branch regression guard
+# ===========================================================================
+class TestDeadCodeGrepRegression(unittest.TestCase):
+    """Static-grep tests guarding against re-introduction of patterns
+    removed in commit b5a4dd6c1. These catch the regression mode where
+    a future contributor re-adds the patterns without a real caller."""
+
+    def test_no_iterable_import_in_sandbox(self):
+        """B2: `from typing import Iterable` was removed from sandbox
+        because no SandboxComponents field used it. Re-addition indicates
+        a regression of the dead-import review.
+        """
+        repo = Path(__file__).resolve().parent.parent.parent
+        src = (repo / "agent" / "claude_code_sandbox.py").read_text()
+        self.assertNotIn(
+            "from typing import Iterable", src,
+            "Iterable import was removed in B2 (b5a4dd6c1); "
+            "re-add only if a SandboxComponents field actually uses it",
+        )
+
+    def test_no_init_channel_branch_in_client(self):
+        """B3: the `elif channel == "init":` branch was removed from
+        _apply_acp_arg_directives because no directive targeted the
+        init channel. Re-addition indicates a regression.
+        """
+        repo = Path(__file__).resolve().parent.parent.parent
+        src = (repo / "agent" / "claude_code_acp_client.py").read_text()
+        self.assertNotIn(
+            'channel == "init"', src,
+            'init channel branch was removed in B3 (b5a4dd6c1); '
+            're-add only with explicit caller that routes to init channel',
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
