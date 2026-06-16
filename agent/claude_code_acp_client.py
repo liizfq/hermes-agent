@@ -529,6 +529,7 @@ class ClaudeCodeACPClient:
         self._session_id: str | None = None
         self._sandbox_path: Path | None = None
         self._pending_session_configs: dict[str, str] = {}
+        self._acp_config_options: list[dict[str, Any]] = []
 
         # Scan _acp_args (runtime directives from caller) for recognized
         # flags (--model, --permission-mode, --effort) and queue them into
@@ -967,6 +968,19 @@ class ClaudeCodeACPClient:
             out.append(entry)
         return out
 
+    def _get_acp_model(self) -> str | None:
+        """Return the current ACP session model from cached configOptions.
+
+        The value comes from the ``session/new`` response (initial default)
+        or the most recent ``session/set_config_option`` response (after a
+        model switch).  Returns *None* when no configOptions have been
+        recorded yet (e.g. session not created).
+        """
+        for opt in self._acp_config_options:
+            if opt.get("id") == "model":
+                return opt.get("currentValue")
+        return None
+
     def _flush_pending_configs(
         self, proc, inbox, stderr_tail, session_id: str
     ) -> None:
@@ -975,13 +989,17 @@ class ClaudeCodeACPClient:
         Order matters: model MUST be flushed first because switching
         models can invalidate subsequent mode/effort settings
         (e.g. Haiku does not support auto mode).
+
+        After each successful flush, updates ``_acp_config_options`` with
+        the response's ``configOptions`` so hermes always knows the actual
+        ACP session config (including defaults).
         """
         _FLUSH_ORDER = ("model", "mode", "effort")
         for config_id in _FLUSH_ORDER:
             if config_id not in self._pending_session_configs:
                 continue
             try:
-                self._request(
+                result = self._request(
                     proc, inbox, stderr_tail,
                     "session/set_config_option",
                     {
@@ -991,6 +1009,9 @@ class ClaudeCodeACPClient:
                     },
                     timeout_seconds=self._default_timeout_seconds,
                 )
+                # Update cached configOptions from response
+                if result and isinstance(result.get("configOptions"), list):
+                    self._acp_config_options = result["configOptions"]
             except Exception as exc:
                 logger.warning(
                     "Failed to set %s via session/set_config_option "
@@ -1017,6 +1038,12 @@ class ClaudeCodeACPClient:
                     self._session_proc, self._session_inbox,
                     self._session_stderr, self._session_id,
                 )
+                acp_model = self._get_acp_model()
+                logger.info(
+                    "ACP session model: %s (session=%s, alive=True)",
+                    acp_model or "(claude-agent-acp default)",
+                    self._session_id,
+                )
                 return (
                     self._session_proc,
                     self._session_inbox,
@@ -1042,7 +1069,16 @@ class ClaudeCodeACPClient:
                     raise RuntimeError(
                         "claude-agent-acp did not return a sessionId from session/new."
                     )
+                # Cache configOptions from session/new response (includes default model)
+                if isinstance(session.get("configOptions"), list):
+                    self._acp_config_options = session["configOptions"]
                 self._flush_pending_configs(proc, inbox, stderr_tail, session_id)
+                acp_model = self._get_acp_model()
+                logger.info(
+                    "ACP session model: %s (session=%s, alive=False)",
+                    acp_model or "(claude-agent-acp default)",
+                    session_id,
+                )
             except Exception:
                 try:
                     proc.terminate()
