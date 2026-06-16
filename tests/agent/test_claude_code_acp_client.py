@@ -402,7 +402,6 @@ class TestClientInit(unittest.TestCase):
         client = _make_client()
         self.assertIsNone(client._session_proc)
         self.assertIsNone(client._session_id)
-        self.assertIsNone(client._pending_model)
         self.assertFalse(client.is_closed)
         self.assertEqual(client._tool_trace, [])
 
@@ -509,13 +508,11 @@ class TestApplyAcpArgDirectives(unittest.TestCase):
     def test_model_flag_seeds_pending(self):
         client = _make_client(acp_args=["--model", "opus", "--stdio"])
         client._apply_acp_arg_directives()
-        self.assertEqual(client._pending_model, "opus")
         self.assertEqual(client._pending_session_configs.get("model"), "opus")
 
     def test_model_flag_invalid_ignored(self):
         client = _make_client(acp_args=["--model", "gpt-4o", "--stdio"])
         client._apply_acp_arg_directives()
-        self.assertIsNone(client._pending_model)
         self.assertNotIn("model", client._pending_session_configs)
 
     def test_permission_mode_flag(self):
@@ -538,7 +535,6 @@ class TestApplyAcpArgDirectives(unittest.TestCase):
             acp_args=["--model", "sonnet", "--permission-mode", "auto", "--effort", "low", "--stdio"]
         )
         client._apply_acp_arg_directives()
-        self.assertEqual(client._pending_model, "sonnet")
         self.assertEqual(client._pending_session_configs["model"], "sonnet")
         self.assertEqual(client._pending_session_configs["mode"], "auto")
         self.assertEqual(client._pending_session_configs["effort"], "low")
@@ -549,22 +545,22 @@ class TestApplyAcpArgDirectives(unittest.TestCase):
         client._apply_acp_arg_directives()
         # acp_args should be unchanged
         self.assertEqual(client._acp_args, args)
-        self.assertEqual(client._pending_model, "haiku")
+        self.assertEqual(client._pending_session_configs.get("model"), "haiku")
 
     def test_duplicate_flag_first_wins(self):
         client = _make_client(acp_args=["--model", "opus", "--model", "haiku", "--stdio"])
         client._apply_acp_arg_directives()
-        self.assertEqual(client._pending_model, "opus")
+        self.assertEqual(client._pending_session_configs.get("model"), "opus")
 
     def test_model_flag_no_value_skipped(self):
         client = _make_client(acp_args=["--model"])
         client._apply_acp_arg_directives()
-        self.assertIsNone(client._pending_model)
+        self.assertNotIn("model", client._pending_session_configs)
 
     def test_empty_acp_args(self):
         client = _make_client(acp_args=[])
         client._apply_acp_arg_directives()
-        self.assertIsNone(client._pending_model)
+        self.assertNotIn("model", client._pending_session_configs)
         self.assertEqual(client._pending_session_configs, {})
 
 
