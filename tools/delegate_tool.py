@@ -1055,7 +1055,7 @@ def _build_child_agent(
         # Detect whether the ACP command targets Claude Code or Copilot.
         _cmd_lower = (override_acp_command or "").lower()
         _args_str = " ".join(override_acp_args or []).lower()
-        if "claude" in _cmd_lower or "claude-agent-acp" in _args_str:
+        if "claude-code-acp" in _cmd_lower:
             effective_provider = "claude-code-acp"
             effective_api_mode = "chat_completions"
         else:
@@ -2726,15 +2726,15 @@ DELEGATE_TASK_SCHEMA = {
                         "acp_command": {
                             "type": "string",
                             "description": (
-                                "Per-task ACP command override (e.g. 'copilot'). "
+                                "Per-task ACP command override (e.g. 'copilot', 'claude-code-acp'). "
                                 "Overrides the top-level acp_command for this task only. "
-                                "Do NOT set unless the user explicitly told you an ACP CLI is installed."
+                                "Do NOT set unless the user explicitly told you an ACP-compatible CLI is installed."
                             ),
                         },
                         "acp_args": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Per-task ACP args override. Leave empty unless acp_command is set.",
+                            "description": "Per-task ACP args override. For supported arguments, see the 'claude-code-acp-delegate' skill. Leave empty unless acp_command is set.",
                         },
                         "role": {
                             "type": "string",
@@ -2757,11 +2757,10 @@ DELEGATE_TASK_SCHEMA = {
             "acp_command": {
                 "type": "string",
                 "description": (
-                    "Override ACP command for child agents (e.g. 'copilot'). "
+                    "Override ACP command for child agents (e.g. 'copilot', 'claude-code-acp'). "
                     "When set, children use ACP subprocess transport instead of inheriting "
-                    "the parent's transport. Requires an ACP-compatible CLI "
-                    "(currently GitHub Copilot CLI via 'copilot --acp --stdio'). "
-                    "See agent/copilot_acp_client.py for the implementation. "
+                    "the parent's transport. Requires an ACP-compatible CLI installed and configured. "
+                    "For details on ACP parameters and usage, see the 'claude-code-acp-delegate' skill. "
                     "IMPORTANT: Do NOT set this unless the user has explicitly told you "
                     "a specific ACP-compatible CLI is installed and configured. "
                     "Leave empty to use the parent's default transport (Hermes subagents)."
@@ -2771,8 +2770,9 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Arguments for the ACP command (default: ['--acp', '--stdio']). "
+                    "Arguments for the ACP command. "
                     "Only used when acp_command is set. "
+                    "For supported arguments by each ACP provider, see the 'claude-code-acp-delegate' skill. "
                     "Leave empty unless acp_command is explicitly provided."
                 ),
             },
